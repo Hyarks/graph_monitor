@@ -14,7 +14,10 @@
 
 #include "rosgraph_monitor/node.hpp"
 
+#include <chrono>
+#include <future>
 #include <memory>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -35,6 +38,33 @@ template<typename T>
 std::unordered_set<T> vec_to_set(const std::vector<T> & in)
 {
   return std::unordered_set<T>(in.begin(), in.end());
+}
+
+// Parameter queries run on their own threads, which the monitor's destructor joins. They wait
+// in short slices so a shutdown ends them within ~100 ms: rclcpp::sleep_for and
+// std::future::wait_for ignore a shutdown that happened before they started waiting, and a
+// full 5 s wait there held the process past launch's SIGINT timeout (SIGTERM escalation).
+constexpr std::chrono::milliseconds SHUTDOWN_POLL{100};
+
+void sleep_unless_shutdown(std::chrono::seconds duration)
+{
+  const auto deadline = std::chrono::steady_clock::now() + duration;
+  while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(SHUTDOWN_POLL);
+  }
+}
+
+/// @return true if the future became ready, false on timeout or shutdown
+template<typename FutureT>
+bool wait_unless_shutdown(FutureT & future, std::chrono::seconds timeout)
+{
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+    if (future.wait_for(SHUTDOWN_POLL) == std::future_status::ready) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace
@@ -122,20 +152,21 @@ std::shared_future<void> Node::query_params(
             rclcpp::get_logger("rosgraph_monitor"),
             "Parameter service for node %s not available, retrying in %d seconds",
             node_name.c_str(), SERVICE_TIMEOUT_S);
-          rclcpp::sleep_for(std::chrono::seconds(SERVICE_TIMEOUT_S));
+          sleep_unless_shutdown(std::chrono::seconds(SERVICE_TIMEOUT_S));
           continue;
         }
 
         auto list_parameters = param_client->list_parameters({}, 0);
 
-        if (list_parameters.wait_for(std::chrono::seconds(SERVICE_TIMEOUT_S)) !=
-        std::future_status::ready)
-        {
+        if (!wait_unless_shutdown(list_parameters, std::chrono::seconds(SERVICE_TIMEOUT_S))) {
+          if (!rclcpp::ok()) {
+            break;
+          }
           RCLCPP_WARN(
             rclcpp::get_logger("rosgraph_monitor"),
             "Parameter query for node %s timed out, retrying in %d seconds", node_name.c_str(),
             SERVICE_TIMEOUT_S);
-          rclcpp::sleep_for(std::chrono::seconds(SERVICE_TIMEOUT_S));
+          sleep_unless_shutdown(std::chrono::seconds(SERVICE_TIMEOUT_S));
           continue;
         }
 
