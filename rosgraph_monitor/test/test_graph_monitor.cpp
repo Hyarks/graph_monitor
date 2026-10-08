@@ -293,14 +293,21 @@ protected:
             result.names = param_names;
             callback(result);
           });
-      });
-
-    graphmon_->set_graph_change_callback(
+      },
+      rosgraph_monitor::GraphMonitorConfiguration{},
       [this](rosgraph_monitor_msgs::msg::Graph & msg) {
         std::lock_guard<std::mutex> lock(graphmon_msg_mutex_);
         queue_.push_back(msg);
         graphmon_msg_cv_.notify_one();
       });
+  }
+
+  ~GraphMonitorTest() override
+  {
+    // The monitor runs threads that read the mocked graph and push into queue_, and it joins
+    // them when it is destroyed. It is declared before those members, so default destruction
+    // order would tear them down while those threads were still using them.
+    graphmon_.reset();
   }
 
   void trigger_and_wait()
@@ -819,8 +826,13 @@ TEST_F(GraphMonitorTest, topic_frequency_stale)
 TEST_F(GraphMonitorTest, rosgraph_generation) {
   // Set up test nodes
   set_node_names({"node1", "node2", "node3"});
-  // Generate rosgraph message
-  rosgraph_monitor_msgs::msg::Graph rosgraph_msg = await_graphmon_msg();
+
+  // The monitor takes an initial look at the graph when it is constructed and reports that,
+  // so skip past it rather than asserting on whichever message happens to be first.
+  rosgraph_monitor_msgs::msg::Graph rosgraph_msg = await_graphmon_msg_until(
+    [](const rosgraph_monitor_msgs::msg::Graph & msg) {return msg.nodes.size() == 3;},
+    std::chrono::milliseconds(500),
+    "Timed out waiting for the graph to report all three nodes");
 
   // Verify the message contains expected nodes
   EXPECT_EQ(rosgraph_msg.nodes.size(), 3);

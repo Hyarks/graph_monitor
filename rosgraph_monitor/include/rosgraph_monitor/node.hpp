@@ -54,13 +54,15 @@ protected:
   rosgraph_monitor::ParamListener param_listener_;
   rosgraph_monitor::Params params_;
 
-  RosGraphMonitor graph_monitor_;
-
   rclcpp::Subscription<rosgraph_monitor_msgs::msg::TopicStatistics>::SharedPtr
     sub_topic_statistics_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_diagnostics_;
   rclcpp::Publisher<rosgraph_monitor_msgs::msg::Graph>::SharedPtr pub_rosgraph_;
   rclcpp::TimerBase::SharedPtr timer_publish_report_;
+
+  // Declared/constructed last, destroyed first: its watch thread and parameter-query threads
+  // call publish_rosgraph(), so they must be joined before the publishers above are freed.
+  RosGraphMonitor graph_monitor_;
 };
 
 }  // namespace rosgraph_monitor

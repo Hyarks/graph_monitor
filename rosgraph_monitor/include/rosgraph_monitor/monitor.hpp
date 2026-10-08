@@ -20,6 +20,7 @@
 #include <thread>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <string>
@@ -49,6 +50,9 @@ typedef std::function<QueryParamsReturnType(
       const std::string & node_name,
       std::function<void (const rcl_interfaces::msg::ListParametersResult &)>
       callback)> QueryParams;
+
+// Optional trigger for the monitor to call, to alert its owner of updates to the graph
+typedef std::function<void (rosgraph_monitor_msgs::msg::Graph &)> GraphChangeCallback;
 
 /// @brief Provide a std::hash specialization so we can use RMW GID as a map key
 template<>
@@ -122,12 +126,15 @@ public:
   /// @param logger
   /// @param config Includes/excludes the entities to care about in diagnostic reporting
   /// @param query_params Function to query parameters of a node by name
+  /// @param change_callback Called (never under the graph lock) whenever the graph changes.
+  ///   Passed here rather than set later so the watch thread never sees it change.
   RosGraphMonitor(
     rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph,
     std::function<rclcpp::Time()> now_fn,
     rclcpp::Logger logger,
     QueryParams query_params,
-    GraphMonitorConfiguration config = GraphMonitorConfiguration{}
+    GraphMonitorConfiguration config = GraphMonitorConfiguration{},
+    GraphChangeCallback change_callback = GraphChangeCallback()
   );
 
   virtual ~RosGraphMonitor();
@@ -153,10 +160,6 @@ public:
 
   /// @brief Fill a Graph message containing current graph state
   void fill_rosgraph_msg(rosgraph_monitor_msgs::msg::Graph & msg);
-
-  /// @brief Set callback function to be called when graph changes
-  /// @param callback Function to call when graph updates occur
-  void set_graph_change_callback(std::function<void(rosgraph_monitor_msgs::msg::Graph &)> callback);
 
 protected:
   /* Types */
@@ -227,7 +230,8 @@ protected:
 
   /// @brief Check current observed state against our tracked state, updating tracking info
   /// @param observed_node_names
-  void track_node_updates(
+  /// @return Names of new or returned nodes, whose parameters the caller should query
+  std::vector<std::string> track_node_updates(
     const std::vector<std::string> & observed_node_names);
 
   /// @brief Check current observed state against our tracked state, updating tracking info
@@ -264,6 +268,9 @@ protected:
   /// @param node_name The name of the node to query parameters for
   void query_node_parameters(const std::string & node_name);
 
+  /// @brief Invoke the graph change callback, if one is set. Must not hold graph_mutex_.
+  void notify_graph_change();
+
   /* Members */
 
   // Configuration
@@ -277,9 +284,19 @@ protected:
   rclcpp::Event::SharedPtr graph_change_event_;
   std::thread watch_thread_;
   Event update_event_;
-  std::function<void()> graph_change_callback_;
 
   QueryParams query_params_;
+  // Only touched by the watch thread (and by the destructor once that thread is joined)
+  std::unordered_map<std::string, std::shared_future<void>> params_futures_;
+
+  /* Three kinds of thread read and write the graph state below:
+   * - the watch thread rebuilding the graph
+   * - each parameter query's thread writing back its results
+   * - the owner's thread(s) reading via evaluate(), fill_rosgraph_msg(), on_topic_statistics()
+   * graph_mutex_ guards all of it. It is never held while invoking graph_change_callback_,
+   * which re-enters fill_rosgraph_msg().
+   */
+  std::mutex graph_mutex_;
 
   // Graph cache
   std::unordered_map<std::string, NodeTracking> nodes_;
@@ -294,7 +311,8 @@ protected:
   std::unordered_map<std::string, TopicTracking> topic_endpoint_counts_;
   std::unordered_set<std::string> pubs_with_no_subs_;  // a.k.a. "leaf topics"
   std::unordered_set<std::string> subs_with_no_pubs_;  // a.k.a. "dead sinks"
-  std::unordered_map<std::string, std::shared_future<void>> params_futures;
+
+  const GraphChangeCallback graph_change_callback_;
 };
 
 }  // namespace rosgraph_monitor

@@ -166,14 +166,16 @@ RosGraphMonitor::RosGraphMonitor(
   std::function<rclcpp::Time()> now_fn,
   rclcpp::Logger logger,
   QueryParams query_params,
-  GraphMonitorConfiguration config
+  GraphMonitorConfiguration config,
+  GraphChangeCallback change_callback
 )
 : config_(config),
   now_fn_(now_fn),
   node_graph_(node_graph),
   logger_(logger),
   graph_change_event_(node_graph->get_graph_event()),
-  query_params_(query_params)
+  query_params_(query_params),
+  graph_change_callback_(change_callback)
 {
   update_graph();
   watch_thread_ = std::thread(std::bind(&RosGraphMonitor::watch_for_updates, this));
@@ -187,18 +189,30 @@ RosGraphMonitor::~RosGraphMonitor()
   node_graph_->notify_shutdown();
   update_event_.set();
 
-  params_futures.clear();
-
   watch_thread_.join();
+
+  // Only safe once the watch thread is gone, since it owns this map. Dropping each future here
+  // joins its query thread, so this is also what keeps those threads from outliving us.
+  params_futures_.clear();
 }
 
 void RosGraphMonitor::update_graph()
 {
-  auto node_names = node_graph_->get_node_names();
-  track_node_updates(node_names);
-
+  const auto node_names = node_graph_->get_node_names();
   const auto topics_and_types = node_graph_->get_topic_names_and_types();
-  track_endpoint_updates(topics_and_types);
+
+  std::vector<std::string> new_nodes;
+  {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    new_nodes = track_node_updates(node_names);
+    track_endpoint_updates(topics_and_types);
+  }
+
+  // Both of these reach back into the tracked state, so neither may run under the lock.
+  for (const auto & node_name : new_nodes) {
+    query_node_parameters(node_name);
+  }
+  notify_graph_change();
 }
 
 bool RosGraphMonitor::ignore_node(const std::string & node_name)
@@ -216,9 +230,11 @@ bool RosGraphMonitor::ignore_node(const std::string & node_name)
   return false;
 }
 
-void RosGraphMonitor::track_node_updates(
+std::vector<std::string> RosGraphMonitor::track_node_updates(
   const std::vector<std::string> & observed_node_names)
 {
+  std::vector<std::string> new_nodes;
+
   // Mark all stale as base state
   for (auto & [node_name, tracking] : nodes_) {
     tracking.stale = true;
@@ -235,7 +251,7 @@ void RosGraphMonitor::track_node_updates(
 
     if (inserted) {
       RCLCPP_DEBUG(logger_, "New node: %s", node_name.c_str());
-      query_node_parameters(node_name);
+      new_nodes.push_back(node_name);
     } else {
       NodeTracking & tracking = it->second;
       tracking.stale = false;
@@ -243,7 +259,7 @@ void RosGraphMonitor::track_node_updates(
         RCLCPP_INFO(logger_, "Node %s came back", node_name.c_str());
         tracking.missing = false;
         returned_nodes_.insert(node_name);
-        query_node_parameters(node_name);
+        new_nodes.push_back(node_name);
       }
     }
   }
@@ -256,10 +272,7 @@ void RosGraphMonitor::track_node_updates(
     }
   }
 
-  // Call graph change callback if set
-  if (graph_change_callback_) {
-    graph_change_callback_();
-  }
+  return new_nodes;
 }
 
 std::optional<RosGraphMonitor::EndpointTrackingMap::iterator> RosGraphMonitor::add_publisher(
@@ -434,6 +447,8 @@ void RosGraphMonitor::evaluate(std::vector<diagnostic_msgs::msg::DiagnosticStatu
   using diagnostic_msgs::msg::DiagnosticStatus;
 
   auto now = now_fn_();
+
+  std::lock_guard<std::mutex> lock(graph_mutex_);
 
   // Nodes
   {
@@ -622,6 +637,7 @@ const GraphMonitorConfiguration & RosGraphMonitor::config() const
 
 void RosGraphMonitor::on_topic_statistics(const rosgraph_monitor_msgs::msg::TopicStatistics & msg)
 {
+  std::lock_guard<std::mutex> lock(graph_mutex_);
   for (const auto & stat : msg.statistics) {
     std::optional<RosRmwGid> maybe_gid;
     EndpointTrackingMap * endpoints = nullptr;
@@ -668,6 +684,7 @@ void RosGraphMonitor::fill_rosgraph_msg(rosgraph_monitor_msgs::msg::Graph & msg)
   msg.timestamp = now_fn_();
   msg.nodes.clear();
 
+  std::lock_guard<std::mutex> lock(graph_mutex_);
   RCLCPP_DEBUG(logger_, "EVENT rosgraph message with %zu nodes", nodes_.size());
 
   for (const auto & [node_name, node_info] : nodes_) {
@@ -701,41 +718,58 @@ void RosGraphMonitor::fill_rosgraph_msg(rosgraph_monitor_msgs::msg::Graph & msg)
   }
 }
 
-void RosGraphMonitor::set_graph_change_callback(
-  std::function<void(rosgraph_monitor_msgs::msg::Graph &)> callback)
+void RosGraphMonitor::notify_graph_change()
 {
-  graph_change_callback_ = [callback, this]() {
-      rosgraph_monitor_msgs::msg::Graph msg;
-      fill_rosgraph_msg(msg);
-      callback(msg);
-    };
+  if (graph_change_callback_) {
+    rosgraph_monitor_msgs::msg::Graph msg;
+    fill_rosgraph_msg(msg);
+    graph_change_callback_(msg);
+  }
 }
 
 void RosGraphMonitor::query_node_parameters(const std::string & node_name)
 {
+  auto existing = params_futures_.find(node_name);
+  if (existing != params_futures_.end() &&
+    existing->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+  {
+    // A query for this node is still retrying (e.g. it went missing and came back before
+    // answering). Keep it: overwriting the future would block this thread until it finishes,
+    // which never happens for a node without parameter services.
+    return;
+  }
+
   // Non-blocking async call for parameter query. Hold onto the future to track completion.
-  params_futures[node_name] = query_params_(
+  params_futures_[node_name] = query_params_(
     node_name,
     [this, node_name_copy = std::string(node_name)](
       const rcl_interfaces::msg::ListParametersResult & result) {
       RCLCPP_INFO(
         logger_, "Got parameters for node %s: %zu", node_name_copy.c_str(),
         result.names.size());
-      auto it = nodes_.find(node_name_copy);
-      if (it == nodes_.end()) {
-        RCLCPP_WARN(logger_, "Node %s not found in tracking map", node_name_copy.c_str());
-        return;
+
+      bool have_params = false;
+      {
+        // This runs on the query's own thread, while the watch thread may be rebuilding nodes_.
+        std::lock_guard<std::mutex> lock(graph_mutex_);
+        auto it = nodes_.find(node_name_copy);
+        if (it == nodes_.end()) {
+          RCLCPP_WARN(logger_, "Node %s not found in tracking map", node_name_copy.c_str());
+          return;
+        }
+        auto & tracking = it->second;
+        tracking.params.clear();
+        tracking.params.reserve(result.names.size());
+        for (const auto & param_name : result.names) {
+          tracking.params.push_back(
+            ParameterTracking{param_name,
+              rcl_interfaces::msg::ParameterType::PARAMETER_NOT_SET});
+        }
+        have_params = !tracking.params.empty();
       }
-      auto & tracking = it->second;
-      tracking.params.clear();
-      tracking.params.reserve(result.names.size());
-      for (const auto & param_name : result.names) {
-        tracking.params.push_back(
-          ParameterTracking{param_name,
-            rcl_interfaces::msg::ParameterType::PARAMETER_NOT_SET});
-      }
-      if (!tracking.params.empty()) {
-        graph_change_callback_();
+
+      if (have_params) {
+        notify_graph_change();
       }
     });
 }
